@@ -407,27 +407,88 @@ def find_autosnps(snpset, samfile):
 
     return num_snps
 
-
-
-
-
-
 def get_build(fname):
-    build=''
+    """
+    Determine the genome build and chromosome naming format from a SAM/BAM/CRAM file.
+    Also sets the global contig and contigmt variables based on the detected format.
+    
+    Args:
+        fname: Filename of the SAM/BAM/CRAM file
+        
+    Returns:
+        int: The detected build number (19, 37, or 38)
+    """
+    global contig, contigmt
+    
+    build = None
+    chrY_found = False
+    Y_found = False
+    y_length = None
+    
     samfile = pysam.AlignmentFile(fname, get_rtype(fname))
-    #print(samfile.text)
-    for l in samfile.text.split('\n'):
-        if not l.startswith('@SQ'):
+    
+    # Y chromosome lengths for different builds
+    y_lengths = {
+        59373566: 37,  # GRCh37/hg19
+        57227415: 38   # GRCh38
+    }
+    
+    # First, check which chromosome naming pattern is used in this file
+    for line in samfile.text.split('\n'):
+        if not line.startswith('@SQ'):
             continue
-        sn = l.split('\t')[1][3:]
-        #print(l.split('\t'))
-        #print(sn)
-        if sn == '1': build=37
-        if sn == 'Y': build=37
-        if sn == 'X': build=37
-        if sn == 'MT': build=37
-        if sn.startswith('chr'): build=38
-    #print(build)
+            
+        parts = line.split('\t')
+        if len(parts) < 3:
+            continue
+            
+        sn = None
+        ln = None
+        
+        for part in parts:
+            if part.startswith('SN:'):
+                sn = part[3:]
+                if sn == 'chrY':
+                    chrY_found = True
+                    # Store the chromosome Y length if available
+                elif sn == 'Y':
+                    Y_found = True
+            
+            # If we found a Y chromosome, get its length
+            if part.startswith('LN:') and sn and (sn == 'Y' or sn == 'chrY'):
+                try:
+                    y_length = int(part[3:])
+                except ValueError:
+                    continue
+    
+    # Print debugging information
+    print(f"Debug - chrY_found: {chrY_found}, Y_found: {Y_found}, Y length: {y_length}")
+    
+    # Set the contig names based on what was found in the file
+    if chrY_found:
+        contig = 'chrY'
+        contigmt = 'chrM'
+        # It could be hg19 or hg38 with 'chr' prefix
+        build = 19 if y_length == 59373566 else 38
+    elif Y_found:
+        contig = 'Y'
+        contigmt = 'MT'
+        # It's likely GRCh37
+        build = 37
+    else:
+        # Default fallback if no Y chromosome found
+        contig = 'Y'  
+        contigmt = 'MT'
+        build = 37
+    
+    # If we have the Y length, use it to determine the build more accurately
+    if y_length:
+        if y_length == 59373566:
+            build = 19 if chrY_found else 37  # Length matches hg19/GRCh37
+        elif y_length == 57227415:
+            build = 38  # Length matches GRCh38
+    
+    print(f"Detected build: {build}, Using contig: {contig}, contigmt: {contigmt}")
     return build
 
 def get_rtype(fname):
@@ -452,35 +513,39 @@ def index_if_needed(samfname):
         pysam.index(samfname)
 
 def setup_conv(in_build):
+    """
+    Set up the conversion parameters based on the detected build.
+    Uses the global contig and contigmt variables that were set by get_build().
+    
+    Args:
+        in_build: The detected genome build number (19, 37, or 38)
+    """
     global b3x
     global str_db_file
-    global contig
-    global contigmt
     global pos_triplet_fn
     global lo_37to38
     global lo_38to37
-    print("Loading LiftOver conversion chain file for build %d..."%in_build)
+    
+    print(f"Loading LiftOver conversion chain file for build {in_build}...")
+    
     if in_build == 19:
-        b3x='b37'
-        str_db_file='str_hg19.gff3'
-        contig='chrY'
-        contigmt='chrM'
+        b3x = 'b37'
+        str_db_file = 'str_hg19.gff3'
         pos_triplet_fn = pos_triplet_37
         lo_37to38 = LiftOver('crossmap/GRCh37_to_GRCh38.chain.gz')
     elif in_build == 37:
-        b3x='b37'
-        str_db_file='str_hg19.gff3'
-        contig='Y'
-        contigmt='MT'
+        b3x = 'b37'
+        str_db_file = 'str_hg19.gff3'
         pos_triplet_fn = pos_triplet_37
         lo_37to38 = LiftOver('crossmap/GRCh37_to_GRCh38.chain.gz')
-    else:
-        b3x='b38'
-        str_db_file='str_hg38.gff3'
-        contig='chrY'
-        contigmt='chrM'
+    else:  # build 38
+        b3x = 'b38'
+        str_db_file = 'str_hg38.gff3'
         pos_triplet_fn = pos_triplet_38
         lo_38to37 = LiftOver('crossmap/GRCh38_to_GRCh37.chain.gz')
+    
+    # Print the final configuration for debugging
+    print(f"Configuration set - Build: {in_build}, b3x: {b3x}, contig: {contig}, contigmt: {contigmt}")
 
 #TODO:temporary interface, redo
 convert_ystr=1
@@ -488,16 +553,35 @@ convert_y=1
 convert_mt=1
 convert_snpauto=0
 def full_convert(samfname):
+    """
+    Main function to process a SAM/BAM/CRAM file and extract SNP information.
+    
+    Args:
+        samfname: Filename of the SAM/BAM/CRAM file
+        
+    Returns:
+        dict: Dictionary of SNP information
+    """
+    # First detect the build and set contig/contigmt globals
+    build = get_build(samfname)
+    
+    # Then set up conversion parameters using the detected build
+    setup_conv(build)
+    
+    # Create index if needed
     index_if_needed(samfname)
+    
+    # Open the alignment file
     samfile = pysam.AlignmentFile(samfname, get_rtype(samfname))
-       
-    snpset={}
-    snpset['Y']={}
-    snpset['MT']={}
-    asnps=0
-    ysnps=0
-    ysrts=0
-    mtnsps=0
+    
+    # Initialize SNP set
+    snpset = {}
+    snpset['Y'] = {}
+    snpset['MT'] = {}
+    asnps = 0
+    ysnps = 0
+    ysrts = 0
+    mtnsps = 0
     
     if convert_snpauto:
         print("Loading SNP DB...")
@@ -510,6 +594,7 @@ def full_convert(samfname):
     if convert_ystr:
         print("Loading STR DB...")
         load_ystr_db()
+        print("Reading Y STRs...")
         ysrts = find_ystrs(snpset, samfile)
 
     if convert_y:
@@ -524,12 +609,12 @@ def full_convert(samfname):
     if convert_mt:
         print("Loading MT DB...")
         load_mtdb()
-        print("Reading SNPs...")
+        print("Reading MT SNPs...")
         mtnsps = find_mtsnps(snpset, samfile)
 
     samfile.close()
     
-    print("Y strs: %d Y snps: %d MT snps: %d"%(ysrts, ysnps, mtnsps))
+    print(f"Y strs: {ysrts} Y snps: {ysnps} MT snps: {mtnsps}")
     
     return snpset
 
